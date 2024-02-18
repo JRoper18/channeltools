@@ -1,45 +1,46 @@
 
-use std::collections::HashMap;
+use std::{borrow::BorrowMut, collections::HashMap};
 
 use image::{self, GenericImageView, Pixel};
-use rs_graph::{self, Buildable, Builder, IndexGraph};
+use rs_graph::{self, traits::DirectedEdge, Buildable, Builder, IndexGraph};
 use rand::{self, seq::SliceRandom};
 
 type LoopEnergyValue = u32;
 type LoopLabel = (usize, usize);
 
-trait ImageEnergy<L, E> {
+pub trait ImageEnergy<L, E> {
     fn dimensions(&self) -> (usize, usize);
     fn single_energy(&self, x : usize, y : usize, label : L) -> E;
     fn dual_energy(&self, x1 : usize, y1: usize, label1 : L, x2 : usize, y2: usize, label2 : L) -> E;
 }
 
 pub fn img_alpha_expansion<L, E>(current_labeling : &Vec<L>, energy : &dyn ImageEnergy<L, E>, alpha_label : L) -> (E, Vec<usize>) where L: Eq + Copy, E : num_traits::NumAssign + Ord + Copy{
-    let mut edge_flows: HashMap<rs_graph::vecgraph::Edge<usize>, E>  = HashMap::new();
+    let mut edge_flows: HashMap<rs_graph::vecgraph::Edge<usize>, E> = HashMap::new();
     let mut b: rs_graph::vecgraph::VecGraphBuilder<usize> = rs_graph::VecGraph::new_builder();
     let current_label_node = b.add_node();
     let alpha_node = b.add_node();
     let (w, h) = energy.dimensions();
     let pixel_id = |x : usize, y : usize| -> usize { (y * w) + x};
+    let mut add_weighed_edge = |b : &mut rs_graph::vecgraph::VecGraphBuilder<usize>, n1, n2, weight| {
+        let e1 = b.add_edge(n1, n2);
+        let e2 = b.add_edge(n2, n1);
+        edge_flows.insert(e1, weight);
+        edge_flows.insert(e2, weight);
+    };
     let pixel_nodes = b.add_nodes(w * h);
-    let mut node_id_to_pixel_id : HashMap<usize, usize> = HashMap::new();
     println!("Building graph");
     for x in 0..w {
         for y in 0..h {
             let pid = pixel_id(x, y);
             let node = pixel_nodes[pid];
-            node_id_to_pixel_id.insert(b.node2id(node), pixel_id(x, y)); 
             let current_label = current_labeling[pixel_id(x, y)];
-            
             // First, add the single energy edges. 
                     
             if current_label != alpha_label {
-                let e1 = b.add_edge(current_label_node, node);
-                edge_flows.insert(e1, energy.single_energy(x, y, current_label));
+                add_weighed_edge(b.borrow_mut(),current_label_node, node, energy.single_energy(x, y, current_label));
             }
 
-            let e2 = b.add_edge(alpha_node, node);
-            edge_flows.insert(e2, energy.single_energy(x, y, alpha_label));
+            add_weighed_edge(b.borrow_mut(),alpha_node, node, energy.single_energy(x, y, alpha_label));
 
 
             // Then, add the dual/smooth-energy edges and additional nodes. 
@@ -62,29 +63,30 @@ pub fn img_alpha_expansion<L, E>(current_labeling : &Vec<L>, energy : &dyn Image
                 let neighbor_label = current_labeling[pixel_id(nx, ny)];
                 if neighbor_label != current_label {
                     let aux_node = b.add_node();
-                    let e3 = b.add_edge(node, aux_node);
-                    edge_flows.insert(e3, energy.dual_energy(x, y, current_label, nx, ny, alpha_label));
+                    add_weighed_edge(b.borrow_mut(),node, aux_node, energy.dual_energy(x, y, current_label, nx, ny, alpha_label));
                 
-                    let e4 = b.add_edge(aux_node, neighbor_node);
-                    edge_flows.insert(e4, energy.dual_energy(x, y, alpha_label, nx, ny, neighbor_label));
+                    add_weighed_edge(b.borrow_mut(),aux_node, neighbor_node, energy.dual_energy(x, y, alpha_label, nx, ny, neighbor_label));
 
-                    let e5 = b.add_edge(current_label_node, aux_node);
-                    edge_flows.insert(e5, energy.dual_energy(x, y, current_label, nx, ny, neighbor_label));
+                    add_weighed_edge(b.borrow_mut(),current_label_node, aux_node, energy.dual_energy(x, y, current_label, nx, ny, neighbor_label));
                 } else {
-                    let e6 = b.add_edge(node, neighbor_node);
-                    edge_flows.insert(e6, energy.dual_energy(x, y, current_label, nx, ny, alpha_label));
+                    add_weighed_edge(b.borrow_mut(),node, neighbor_node, energy.dual_energy(x, y, current_label, nx, ny, alpha_label));
                 }
             }
         }
     }
-    println!("Built graph");
     let g = b.into_graph();
-    let (energy, _flows, min_cut) = rs_graph::maxflow::dinic::dinic(&g, current_label_node, alpha_node, |edge| edge_flows[&edge]);
-    let mut ret : Vec<usize> = Vec::with_capacity(min_cut.len());
+    let (min_energy, _flows, min_cut) = rs_graph::maxflow::dinic::dinic(&g, current_label_node, alpha_node, |edge| edge_flows[&edge]);
+    let mut ret : Vec<usize> = Vec::with_capacity(min_cut.len() - 1);
     for node in min_cut {
-        ret.push(node_id_to_pixel_id[&g.node_id(node)]);
+        let node_id = g.node_id(node);
+        if node_id < 2 {
+            // If it's source/sink node. 
+            continue;
+        }
+        let pixel_id = node_id - 2;
+        ret.push(pixel_id);
     }
-    return (energy, ret);
+    return (min_energy, ret);
 }
 
 struct LoopEnergy {
@@ -145,7 +147,8 @@ impl ImageEnergy<LoopLabel, LoopEnergyValue> for LoopEnergy {
             spatial += pixel_dist(self.pixel_at_looped_time(x1, y1, time, label1), self.pixel_at_looped_time(x1, y1, time, label2));
             spatial += pixel_dist(self.pixel_at_looped_time(x2, y2, time, label1), self.pixel_at_looped_time(x2, y2, time, label2));
         }
-        return spatial / (self.frames.len() as LoopEnergyValue);
+        let ret = spatial / (self.frames.len() as LoopEnergyValue); 
+        return ret
     }
 }
 
@@ -170,12 +173,14 @@ fn main() {
             possible_labels.push((p, s));
         }
     }
+    let mut i = 0;
     loop {
         let alpha_label = *(possible_labels.choose(&mut rand::thread_rng()).unwrap());
-
+        i += 1;
         let (new_energy, new_alpha_idxs) = img_alpha_expansion(&current_labeling, &energy_container, alpha_label);
         for alpha_idx in new_alpha_idxs {
             current_labeling[alpha_idx] = alpha_label;
+            println!("{}", alpha_idx);
         }
         println!("Energy: {}", new_energy);
         if new_energy < 10 {
