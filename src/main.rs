@@ -17,9 +17,10 @@ pub trait ImageEnergy<L, E> {
 pub fn img_alpha_expansion<L, E>(current_labeling : &Vec<L>, energy : &dyn ImageEnergy<L, E>, alpha_label : L) -> (E, Vec<usize>) where L: Eq + Copy, E : num_traits::NumAssign + Ord + Copy{
     let mut edge_flows: HashMap<rs_graph::vecgraph::Edge<usize>, E> = HashMap::new();
     let mut b: rs_graph::vecgraph::VecGraphBuilder<usize> = rs_graph::VecGraph::new_builder();
+    let (w, h) = energy.dimensions();
+    let pixel_nodes = b.add_nodes(w * h); // Add these first so their IDs are 0-indexed. 
     let current_label_node = b.add_node();
     let alpha_node = b.add_node();
-    let (w, h) = energy.dimensions();
     let pixel_id = |x : usize, y : usize| -> usize { (y * w) + x};
     let mut add_weighed_edge = |b : &mut rs_graph::vecgraph::VecGraphBuilder<usize>, n1, n2, weight| {
         let e1 = b.add_edge(n1, n2);
@@ -27,7 +28,6 @@ pub fn img_alpha_expansion<L, E>(current_labeling : &Vec<L>, energy : &dyn Image
         edge_flows.insert(e1, weight);
         edge_flows.insert(e2, weight);
     };
-    let pixel_nodes = b.add_nodes(w * h);
     println!("Building graph");
     for x in 0..w {
         for y in 0..h {
@@ -79,11 +79,11 @@ pub fn img_alpha_expansion<L, E>(current_labeling : &Vec<L>, energy : &dyn Image
     let mut ret : Vec<usize> = Vec::with_capacity(min_cut.len() - 1);
     for node in min_cut {
         let node_id = g.node_id(node);
-        if node_id < 2 {
-            // If it's source/sink node. 
+        if node_id >= pixel_nodes.len() {
+            // If it's source/sink node or one of the aux ones. 
             continue;
         }
-        let pixel_id = node_id - 2;
+        let pixel_id = node_id;
         ret.push(pixel_id);
     }
     return (min_energy, ret);
@@ -112,7 +112,7 @@ impl LoopEnergy {
     }
 
     fn pixel_at_looped_time(&self, x : usize, y : usize, time : usize, label : LoopLabel) -> image::Rgba<u8> {
-        let (start_time, period) = label;
+        let (period, start_time) = label;
         let num_frames = self.frames.len();
         let loop_time = start_time + ((num_frames + time - start_time) % period);
         return self.pixel_at_time(x, y, loop_time);
@@ -129,7 +129,7 @@ impl ImageEnergy<LoopLabel, LoopEnergyValue> for LoopEnergy {
 
     fn single_energy(&self, x : usize, y : usize, label : LoopLabel) -> LoopEnergyValue {
         // temporal energy doesn't rely on neigbors in (x, y) space. 
-        let (start_time, period) = label;
+        let (period, start_time) = label;
         let end_time = start_time + period;
         if period == 1 {
             // Use the static energy instead. 
@@ -152,7 +152,20 @@ impl ImageEnergy<LoopLabel, LoopEnergyValue> for LoopEnergy {
     }
 }
 
+fn save_debug_label_img(path : &std::path::Path, labels : &Vec<LoopLabel>, dimensions : (usize, usize)) {
+    let (w, h) = dimensions;
+    let mut period_img = image::RgbImage::new(w.try_into().unwrap(), h.try_into().unwrap());
+    for i in 0..labels.len() {
+        let (period, start) = labels[i];
+        let x = i % w;
+        let y = (i - x) / w;
+        period_img.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), image::Rgb([period * 3, period * 3, period * 3].map(|p| p.try_into().unwrap())));
+    }
+    period_img.save(path);
+}
+
 fn main() {
+    // Load the initial image frames into memory. 
     let paths = std::fs::read_dir("./resources/v1").unwrap();
     let mut frames = Vec::new();
     for path in paths {
@@ -161,31 +174,54 @@ fn main() {
         frames.push(image::DynamicImage::ImageRgba8(image::imageops::resize(&img, w / 4, h / 4, image::imageops::FilterType::Nearest))); 
     }
     let num_frames = frames.len();
-    let energy_container = LoopEnergy { frames : frames, static_cost : 20 };
+    
+    // seed the initial parameters and labels. 
+
+    let energy_container = LoopEnergy { frames : frames, static_cost : 20000 };
     let (w, h) = energy_container.dimensions();
     let mut current_labeling: Vec<LoopLabel> = Vec::with_capacity(w * h);
     for i in 0..(w * h) {
         current_labeling.push((2, 2));
     }
+    // generate possible labels. 
+
     let mut possible_labels : Vec<LoopLabel> = Vec::new();
-    for p in 1..num_frames+1 {
+    let minimum_period = 8;
+    for p in minimum_period..num_frames+1 {
         for s in 0..num_frames {
             possible_labels.push((p, s));
         }
     }
-    let mut i = 0;
-    loop {
+    // figure out optimal per-pixel labelings. 
+    let max_iter = 20;
+    for i in 0..max_iter {
         let alpha_label = *(possible_labels.choose(&mut rand::thread_rng()).unwrap());
-        i += 1;
         let (new_energy, new_alpha_idxs) = img_alpha_expansion(&current_labeling, &energy_container, alpha_label);
         for alpha_idx in new_alpha_idxs {
             current_labeling[alpha_idx] = alpha_label;
-            println!("{}", alpha_idx);
         }
         println!("Energy: {}", new_energy);
         if new_energy < 10 {
             break;
         }
+        let path_str = format!("./periods_{}.png", i);
+        save_debug_label_img(std::path::Path::new(&path_str), &current_labeling, (w, h));
     }
+
+    // make the loop images themselves. 
+    for i in 0..num_frames {
+        let path_str = format!("./resources/v1_output/{}.png", i);
+        let mut looped_frame = image::RgbImage::new(w.try_into().unwrap(), h.try_into().unwrap());
+        for label_idx in 0..current_labeling.len() {
+            let pixel_label = current_labeling[i];
+            let x = label_idx % w;
+            let y = (label_idx - x) / w;
+            looped_frame.put_pixel(x.try_into().unwrap(), y.try_into().unwrap(), energy_container.pixel_at_looped_time(x, y, i, pixel_label).to_rgb());
+        }
+        looped_frame.save(std::path::Path::new(&path_str));
+    
+    }
+
+    // ffmpeg -framerate 30 -i resources/v1_output/%d.png resources/v1_loop.mp4
 
 }
