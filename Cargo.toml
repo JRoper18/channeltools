@@ -11,3 +11,9 @@ num-traits = "0.2.18"
 ran = "2.0.1"
 rand = "0.8.5"
 rs-graph = "0.21.0"
+
+
+[dependencies.ffmpeg-next]
+version = "6.1.1"
+default-features = false
+features = ["codec", "format", "software-scaling"]
